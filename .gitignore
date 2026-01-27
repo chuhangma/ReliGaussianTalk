@@ -1,0 +1,154 @@
+# ============================================
+# ReliGaussianTalk - Git Ignore File
+# ============================================
+
+# ===========================================
+# Large Data Files (DO NOT UPLOAD)
+# ===========================================
+
+# Training/evaluation data
+data/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Large model checkpoints and weights
+*.ckpt
+*.pth
+*.pt
+*.tar
+*.pkl
+!requirements*.txt
+
+# DECA model files (too large)
+preprocess/submodules/DECA/data/deca_model.tar
+preprocess/submodules/DECA/data/generic_model.pkl
+preprocess/submodules/DECA/data/texture_data_256.npy
+
+# MODNet pretrained models
+preprocess/submodules/MODNet/pretrained/*.ckpt
+
+# Face-parsing model
+preprocess/submodules/face-parsing.PyTorch/res/cp/*.pth
+
+# FLAME model files (licensed separately)
+code/flame/FLAME2020/*.pkl
+
+# ===========================================
+# Generated/Intermediate Files
+# ===========================================
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# C/C++ build files
+*.o
+*.obj
+*.a
+*.lib
+
+# ===========================================
+# IDE and Editor Files
+# ===========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ===========================================
+# System Files
+# ===========================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===========================================
+# Experiment Outputs
+# ===========================================
+outputs/
+experiments/
+results/
+logs/
+*.log
+tensorboard/
+wandb/
+
+# TensorBoard event files
+events.out.tfevents.*
+preprocess/submodules/DECA/logs/events.*
+preprocess/submodules/DECA/logs/train.log
+
+# ===========================================
+# Temporary Files
+# ===========================================
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+
+# ===========================================
+# Large GIF files (for documentation, can be hosted elsewhere)
+# ===========================================
+preprocess/submodules/MODNet/doc/gif/*.gif
+preprocess/submodules/DECA/Doc/images/*.gif
+
+# ===========================================
+# Numpy data files (usually generated or large)
+# ===========================================
+# Note: Keep small config .npy files, exclude large data ones
+preprocess/submodules/DECA/data/texture_data_256.npy
+preprocess/submodules/DECA/data/fixed_displacement_256.npy
+
+# ===========================================
+# JSON data files (usually generated)
+# ===========================================
+# Keep config JSONs, exclude large generated data
+**/code.json
+**/flame_params.json
+**/keypoint.json
+**/iris.json
+
+# ===========================================
+# Environment and Config
+# ===========================================
+.env
+.env.local
+*.local
+
+# Conda/pip
+*.conda
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ===========================================
+# Jupyter Notebooks checkpoints
+# ===========================================
+.ipynb_checkpoints/
+
+# ===========================================
+# Keep these files (override ignores)
+# ===========================================
+!requirements.txt
+!requirements_fixed.txt
+!environment.yml
+!README.md
+!README_*.md
+!LICENSE
+!*.conf
+!.gitignore
