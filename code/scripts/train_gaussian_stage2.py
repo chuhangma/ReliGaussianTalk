@@ -18,6 +18,7 @@ import json
 import random
 
 from pyhocon import ConfigFactory
+from torch.utils.tensorboard import SummaryWriter
 
 # Gaussian modules
 from scene.relightable_gaussian_model import RelightableGaussianModel
@@ -205,6 +206,21 @@ class Stage2TrainRunner:
         
         # Training state
         self.start_epoch = 0
+        self.iteration = 0
+        
+        # Initialize TensorBoard writer
+        # TensorBoard: 从配置文件读取路径，如果未设置则使用默认路径
+        tensorboard_base = self.conf.get_string('train.tensorboard_dir', default='')
+        if tensorboard_base and tensorboard_base.strip():
+            # 使用配置文件中的路径，添加实验名称作为子目录
+            subject_name = self.conf.get_string('dataset.subject_name', default='unknown')
+            tensorboard_dir = os.path.join(tensorboard_base, subject_name, 'stage2')
+        else:
+            # 默认路径：在训练输出目录下
+            tensorboard_dir = os.path.join(self.train_dir, 'tensorboard')
+        utils.mkdir_ifnotexists(tensorboard_dir)
+        self.writer = SummaryWriter(log_dir=tensorboard_dir)
+        print(f"TensorBoard logs: {tensorboard_dir}")
         
         # Load checkpoint if continuing
         if self.is_continue:
@@ -325,16 +341,22 @@ class Stage2TrainRunner:
         s = 8  # Specular exponent
         pi = torch.acos(torch.zeros(1)).item() * 2
         
+        # Epoch-level loss accumulators for TensorBoard
+        loss_keys = ['rgb', 'vgg', 'albedo_smooth', 'normal', 'light_reg', 'total']
+        
         for epoch in range(self.start_epoch, self.nepochs):
             self.albedo_net.train()
             self.normal_net.train()
             self.spec_net.train()
             
             epoch_loss = 0.0
+            epoch_loss_accum = {k: 0.0 for k in loss_keys}
             
             pbar = tqdm(self.train_dataloader, desc=f"Epoch {epoch}")
             
             for batch_idx, (indices, model_input, ground_truth) in enumerate(pbar):
+                self.iteration += 1
+                
                 # Move to GPU
                 for k, v in model_input.items():
                     if isinstance(v, torch.Tensor):
@@ -345,7 +367,7 @@ class Stage2TrainRunner:
                         ground_truth[k] = v.cuda()
                 
                 # Forward pass
-                loss, loss_dict = self._train_step(
+                loss, loss_dict, rendered_images = self._train_step(
                     model_input, ground_truth, 
                     sample_index, s, pi, epoch
                 )
@@ -356,6 +378,20 @@ class Stage2TrainRunner:
                 self.optimizer.step()
                 
                 epoch_loss += loss.item()
+                
+                # Accumulate losses for epoch average
+                for k, v in loss_dict.items():
+                    if k in epoch_loss_accum:
+                        epoch_loss_accum[k] += v
+                
+                # TensorBoard: Log iteration-level losses (every 50 iterations)
+                if self.iteration % 50 == 0:
+                    for loss_name, loss_value in loss_dict.items():
+                        self.writer.add_scalar(f'train_iter/{loss_name}', loss_value, self.iteration)
+                
+                # TensorBoard: Log images (every 200 iterations)
+                if self.iteration % 200 == 0 and rendered_images is not None:
+                    self._log_images_to_tensorboard(rendered_images, self.iteration)
                 
                 # Update progress bar
                 pbar.set_postfix({
@@ -372,14 +408,65 @@ class Stage2TrainRunner:
             print(f"Epoch {epoch}: avg_loss = {avg_loss:.6f}")
             print(f"  Estimated light: {light.detach().cpu().numpy()}")
             
+            # TensorBoard: Log epoch-level average losses
+            num_batches = len(self.train_dataloader)
+            for loss_name, loss_sum in epoch_loss_accum.items():
+                self.writer.add_scalar(f'train_epoch/{loss_name}', loss_sum / num_batches, epoch)
+            
+            # TensorBoard: Log learning rate
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.writer.add_scalar('train/learning_rate', current_lr, epoch)
+            
+            # TensorBoard: Log lighting coefficients
+            self._log_lighting_to_tensorboard(epoch)
+            
             # Save checkpoint
             self.save_checkpoint(epoch)
             
             # Evaluation
             if epoch % 5 == 0:
-                self._evaluate(epoch)
-                
+                eval_metrics = self._evaluate(epoch)
+                # Log evaluation metrics to TensorBoard
+                if eval_metrics:
+                    for metric_name, metric_value in eval_metrics.items():
+                        self.writer.add_scalar(f'eval/{metric_name}', metric_value, epoch)
+        
+        # Close TensorBoard writer
+        self.writer.close()
         print("Training completed!")
+    
+    def _log_images_to_tensorboard(self, rendered_images, step):
+        """Log rendered images to TensorBoard"""
+        if 'final' in rendered_images:
+            self.writer.add_image('train/final_render', rendered_images['final'], step)
+        if 'gt' in rendered_images:
+            self.writer.add_image('train/ground_truth', rendered_images['gt'], step)
+        if 'albedo' in rendered_images:
+            self.writer.add_image('train/albedo', rendered_images['albedo'], step)
+        if 'shading' in rendered_images:
+            self.writer.add_image('train/shading', rendered_images['shading'], step)
+        if 'normal' in rendered_images:
+            # Normalize normal map for visualization
+            normal_viz = (rendered_images['normal'] + 1) / 2
+            self.writer.add_image('train/normal', normal_viz, step)
+        if 'fine_normal' in rendered_images:
+            normal_viz = (rendered_images['fine_normal'] + 1) / 2
+            self.writer.add_image('train/fine_normal', normal_viz, step)
+        if 'specular' in rendered_images:
+            self.writer.add_image('train/specular', rendered_images['specular'], step)
+    
+    def _log_lighting_to_tensorboard(self, epoch):
+        """Log lighting coefficients to TensorBoard"""
+        with torch.no_grad():
+            light = torch.clamp(self.light_var, -2.0, 2.0)
+            
+            # Log individual SH coefficients
+            sh_names = ['ambient', 'y', 'z', 'x', 'xy', 'yz', 'z2', 'xz', 'x2-y2']
+            for i, name in enumerate(sh_names):
+                self.writer.add_scalar(f'lighting/sh_{i}_{name}', light[i].item(), epoch)
+            
+            # Log as histogram for distribution overview
+            self.writer.add_histogram('lighting/sh_coeffs', light.cpu(), epoch)
         
     def _train_step(self, model_input, ground_truth, sample_index, s, pi, epoch):
         """Single training step for relighting"""
@@ -523,7 +610,18 @@ class Stage2TrainRunner:
         
         loss_dict['total'] = total_loss.item()
         
-        return total_loss, loss_dict
+        # Prepare images for TensorBoard (detach to avoid memory issues)
+        rendered_images = {
+            'final': final_image[0].detach().clamp(0, 1),
+            'gt': rgb_input[0].detach().clamp(0, 1),
+            'albedo': albedo[0].detach().clamp(0, 1),
+            'shading': masked_shading[0].repeat(3, 1, 1).detach().clamp(0, 1),
+            'normal': normal[0].detach(),
+            'fine_normal': fine_normal[0].detach(),
+            'specular': masked_spec[0].repeat(3, 1, 1).detach().clamp(0, 1),
+        }
+        
+        return total_loss, loss_dict, rendered_images
     
     def _smoothness_loss(self, img):
         """Compute smoothness loss"""
@@ -532,7 +630,11 @@ class Stage2TrainRunner:
         return dx.abs().mean() + dy.abs().mean()
     
     def _evaluate(self, epoch):
-        """Evaluate and save results"""
+        """Evaluate and save results
+        
+        Returns:
+            eval_metrics: Dictionary of evaluation metrics for TensorBoard
+        """
         self.albedo_net.eval()
         self.normal_net.eval()
         self.spec_net.eval()
@@ -546,11 +648,17 @@ class Stage2TrainRunner:
         s = 8
         pi = torch.acos(torch.zeros(1)).item() * 2
         
+        # Metrics accumulators
+        total_rgb_loss = 0.0
+        total_albedo_smooth = 0.0
+        total_normal_consistency = 0.0
+        num_samples = 0
+        
+        # For TensorBoard image logging
+        sample_images = []
+        
         with torch.no_grad():
             for batch_idx, (indices, model_input, ground_truth) in enumerate(tqdm(self.test_dataloader)):
-                if batch_idx >= 10:  # Only save first 10 samples
-                    break
-                    
                 # Move to GPU
                 for k, v in model_input.items():
                     if isinstance(v, torch.Tensor):
@@ -578,6 +686,37 @@ class Stage2TrainRunner:
                 albedo = self.albedo_net(rgb_input * 2 - 1)
                 fine_normal = (self.normal_net(torch.cat([rgb_input * 2 - 1, normal], dim=1)) + 1) / 2 * face_mask * 2 - 1
                 specmap = self.spec_net(torch.cat([rgb_input * 2 - 1, fine_normal], dim=1))
+                
+                # Compute reconstruction with estimated light
+                light = torch.clamp(self.light_var, -2.0, 2.0)
+                shading = add_SHlight(self.constant_factor, fine_normal, light.view(1, -1, 1))
+                shading = (shading - shading.min()) / (shading.max() - shading.min() + 1e-7) * face_mask
+                recon_image = torch.clamp(albedo * shading, 0, 1)
+                
+                # Compute metrics
+                rgb_loss = torch.mean(torch.abs(recon_image * face_mask - rgb_input * face_mask))
+                total_rgb_loss += rgb_loss.item()
+                
+                albedo_smooth = self._smoothness_loss(albedo * face_mask)
+                total_albedo_smooth += albedo_smooth.item()
+                
+                normal_consistency = torch.mean(torch.abs(fine_normal * face_mask - normal * face_mask))
+                total_normal_consistency += normal_consistency.item()
+                
+                num_samples += 1
+                
+                # Collect sample images for TensorBoard (first 4 samples)
+                if len(sample_images) < 4:
+                    sample_images.append({
+                        'recon': recon_image[0].cpu(),
+                        'gt': rgb_input[0].cpu(),
+                        'albedo': albedo[0].cpu(),
+                        'normal': fine_normal[0].cpu(),
+                    })
+                
+                # Save results (only first 10 samples)
+                if batch_idx >= 10:
+                    continue
                 
                 # Render with different lightings
                 results = []
@@ -609,7 +748,56 @@ class Stage2TrainRunner:
                         os.path.join(eval_epoch_dir, f'{frame_id:05d}_relit_{i}.png')
                     )
         
+        # Compute average metrics
+        eval_metrics = {
+            'rgb_loss': total_rgb_loss / max(num_samples, 1),
+            'albedo_smooth': total_albedo_smooth / max(num_samples, 1),
+            'normal_consistency': total_normal_consistency / max(num_samples, 1),
+        }
+        
+        print(f"Evaluation metrics: RGB_Loss={eval_metrics['rgb_loss']:.4f}, "
+              f"Albedo_Smooth={eval_metrics['albedo_smooth']:.4f}, "
+              f"Normal_Consistency={eval_metrics['normal_consistency']:.4f}")
+        
+        # Log sample evaluation images to TensorBoard
+        if sample_images:
+            # Create grids for comparison
+            recon_grid = torch.stack([img['recon'] for img in sample_images])
+            gt_grid = torch.stack([img['gt'] for img in sample_images])
+            albedo_grid = torch.stack([img['albedo'] for img in sample_images])
+            normal_grid = torch.stack([(img['normal'] + 1) / 2 for img in sample_images])
+            
+            # Make grids (recon vs GT comparison)
+            combined = torch.cat([recon_grid, gt_grid], dim=0)
+            grid = torchvision.utils.make_grid(combined, nrow=4, normalize=False)
+            self.writer.add_image('eval/recon_vs_gt', grid, epoch)
+            
+            # Albedo grid
+            albedo_viz = torchvision.utils.make_grid(albedo_grid, nrow=4, normalize=False)
+            self.writer.add_image('eval/albedo', albedo_viz, epoch)
+            
+            # Normal grid
+            normal_viz = torchvision.utils.make_grid(normal_grid, nrow=4, normalize=False)
+            self.writer.add_image('eval/normals', normal_viz, epoch)
+            
+            # Relighting demo: render first sample with 4 different lights
+            if sample_images:
+                demo_albedo = sample_images[0]['albedo'].unsqueeze(0).cuda()
+                demo_normal = sample_images[0]['normal'].unsqueeze(0).cuda()
+                relit_samples = []
+                for sample_light in self.sample_lights[:4]:
+                    shading = add_SHlight(self.constant_factor, demo_normal, sample_light.view(1, -1, 1))
+                    shading = (shading - shading.min()) / (shading.max() - shading.min() + 1e-7)
+                    relit = torch.clamp(demo_albedo * shading, 0, 1)
+                    relit_samples.append(relit[0].cpu())
+                
+                relit_grid = torch.stack(relit_samples)
+                relit_viz = torchvision.utils.make_grid(relit_grid, nrow=4, normalize=False)
+                self.writer.add_image('eval/relighting_demo', relit_viz, epoch)
+        
         print(f"Saved evaluation results to {eval_epoch_dir}")
+        
+        return eval_metrics
 
 
 if __name__ == '__main__':

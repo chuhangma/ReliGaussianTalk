@@ -280,7 +280,9 @@ def main():
     
     # Create renderer
     renderer = RelightableGaussianRenderer(
-        sh_degree=model.max_sh_degree,
+        img_height=args.image_height,
+        img_width=args.image_width,
+        sh_degree=model.max_sh_degree if hasattr(model, 'max_sh_degree') else 2,
         bg_color=(1.0, 1.0, 1.0)
     ).to(device)
     

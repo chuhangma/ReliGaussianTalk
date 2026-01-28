@@ -333,59 +333,108 @@ class GaussianRelightDataset(Dataset):
 class GaussianInitDataset(Dataset):
     """
     Dataset for initializing Gaussian point cloud from FLAME mesh.
+    
+    NOTE: Following GaussianTalker's approach, we use the exact number of 
+    vertices from the 3DMM (FLAME/BFM) mesh for initialization instead of
+    arbitrary upsampling. This provides better initialization for talking heads.
+    
+    - BFM: 34,650 vertices (GaussianTalker default)
+    - FLAME: ~5,023 vertices
     """
     
     def __init__(self, 
                  flame_model_path: str,
                  shape_params: torch.Tensor,
-                 num_samples: int = 50000):
+                 num_samples: int = None,  # Now defaults to None = use mesh vertices directly
+                 use_mesh_vertices: bool = True):  # New flag to use direct mesh vertices
         """
         Args:
             flame_model_path: Path to FLAME model
             shape_params: FLAME shape parameters (100,)
-            num_samples: Number of points to sample from FLAME mesh
+            num_samples: Number of points to sample (if None and use_mesh_vertices=True, 
+                         use exact mesh vertex count like GaussianTalker)
+            use_mesh_vertices: If True, use exact mesh vertices without up/downsampling
         """
         self.flame_model_path = flame_model_path
         self.shape_params = shape_params
         self.num_samples = num_samples
+        self.use_mesh_vertices = use_mesh_vertices
         
     def generate_init_points(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate initial point cloud from FLAME mesh.
+        
+        Following GaussianTalker approach:
+        - If use_mesh_vertices=True, use exact mesh vertex positions
+        - Otherwise, up/downsample to num_samples
         
         Returns:
             points: (N, 3) 3D positions
             colors: (N, 3) initial colors (gray)
             normals: (N, 3) normal vectors
         """
+        mesh_loaded = False
+        
         try:
             # Try to load FLAME model
-            from model.flame import FLAME
-            flame = FLAME(self.flame_model_path)
+            from flame.FLAME import FLAME
             
-            # Get canonical mesh vertices
+            # Get shape parameters count from self.shape_params
+            n_shape = self.shape_params.shape[0] if len(self.shape_params.shape) == 1 else self.shape_params.shape[1]
+            n_exp = 50  # Default expression params count
+            
+            # Prepare shape_params for FLAME initialization
+            shape_params_2d = self.shape_params.unsqueeze(0) if len(self.shape_params.shape) == 1 else self.shape_params
+            
+            flame = FLAME(
+                flame_model_path=self.flame_model_path,
+                n_shape=n_shape,
+                n_exp=n_exp,
+                shape_params=shape_params_2d
+            ).cuda()
+            
+            # Get canonical mesh vertices using forward() method
+            # forward() takes: expression_params (N, n_exp), full_pose (N, 15)
             with torch.no_grad():
-                vertices = flame.forward_geo(
-                    self.shape_params.unsqueeze(0),
-                    torch.zeros(1, 50),  # expression
-                    torch.zeros(1, 6),   # pose
-                )
-                vertices = vertices[0]  # (V, 3)
+                expression = torch.zeros(1, n_exp).cuda()
+                full_pose = torch.zeros(1, 15).cuda()  # FLAME uses 15 pose params
+                
+                # forward returns: vertices, pose_feature, transformations
+                vertices, _, _ = flame.forward(expression, full_pose)
+                vertices = vertices[0].cpu()  # (V, 3), move back to CPU
                 
                 # Get faces for normal computation
-                faces = flame.faces
+                faces = flame.faces_tensor.cpu()
                 
                 # Compute vertex normals
                 normals = self._compute_vertex_normals(vertices, faces)
                 
+            mesh_loaded = True
+            original_vertex_count = vertices.shape[0]
+            print(f"[GaussianInitDataset] Loaded FLAME mesh with {original_vertex_count} vertices")
+                
         except Exception as e:
             print(f"Failed to load FLAME model: {e}")
-            print("Using random initialization instead")
+            print("Using random sphere initialization instead")
+            mesh_loaded = False
+        
+        # Determine final point count
+        if self.use_mesh_vertices and mesh_loaded:
+            # Use exact mesh vertices like GaussianTalker
+            final_count = vertices.shape[0]
+            print(f"[GaussianInitDataset] Using exact mesh vertices: {final_count} Gaussians")
+        elif self.num_samples is not None:
+            final_count = self.num_samples
+        else:
+            # Default fallback
+            final_count = 5023  # FLAME default vertex count
+            print(f"[GaussianInitDataset] Using default FLAME vertex count: {final_count}")
             
-            # Random sphere initialization
-            theta = torch.rand(self.num_samples) * 2 * np.pi
-            phi = torch.acos(2 * torch.rand(self.num_samples) - 1)
-            r = 0.2 + 0.1 * torch.rand(self.num_samples)  # Head-sized sphere
+        if not mesh_loaded:
+            # Random sphere initialization with final_count points
+            theta = torch.rand(final_count) * 2 * np.pi
+            phi = torch.acos(2 * torch.rand(final_count) - 1)
+            r = 0.2 + 0.1 * torch.rand(final_count)  # Head-sized sphere
             
             x = r * torch.sin(phi) * torch.cos(theta)
             y = r * torch.sin(phi) * torch.sin(theta) 
@@ -394,23 +443,31 @@ class GaussianInitDataset(Dataset):
             vertices = torch.stack([x, y, z], dim=1)
             normals = vertices / torch.norm(vertices, dim=1, keepdim=True)
         
-        # Sample points from mesh surface
-        if vertices.shape[0] < self.num_samples:
-            # Upsample by adding noise
-            repeat_factor = (self.num_samples // vertices.shape[0]) + 1
-            vertices = vertices.repeat(repeat_factor, 1)[:self.num_samples]
-            normals = normals.repeat(repeat_factor, 1)[:self.num_samples]
-            
-            # Add small noise
-            vertices = vertices + 0.001 * torch.randn_like(vertices)
-        else:
-            # Random subsample
-            indices = torch.randperm(vertices.shape[0])[:self.num_samples]
-            vertices = vertices[indices]
-            normals = normals[indices]
+        # Only apply up/downsampling if NOT using mesh vertices directly
+        if not self.use_mesh_vertices and mesh_loaded and self.num_samples is not None:
+            if vertices.shape[0] < self.num_samples:
+                # Upsample by adding noise
+                repeat_factor = (self.num_samples // vertices.shape[0]) + 1
+                vertices = vertices.repeat(repeat_factor, 1)[:self.num_samples]
+                normals = normals.repeat(repeat_factor, 1)[:self.num_samples]
+                
+                # Add small noise to break exact duplicates
+                vertices = vertices + 0.001 * torch.randn_like(vertices)
+                print(f"[GaussianInitDataset] Upsampled to {self.num_samples} points")
+            elif vertices.shape[0] > self.num_samples:
+                # Random subsample
+                indices = torch.randperm(vertices.shape[0])[:self.num_samples]
+                vertices = vertices[indices]
+                normals = normals[indices]
+                print(f"[GaussianInitDataset] Downsampled to {self.num_samples} points")
         
-        # Initialize colors as gray
-        colors = 0.5 * torch.ones((self.num_samples, 3))
+        # Final count for colors
+        actual_count = vertices.shape[0]
+        
+        # Initialize colors as gray (0.5)
+        colors = 0.5 * torch.ones((actual_count, 3))
+        
+        print(f"[GaussianInitDataset] Final initialization: {actual_count} Gaussians")
         
         return vertices, colors, normals
     

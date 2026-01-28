@@ -122,10 +122,14 @@ class RelightableGaussianRenderer(nn.Module):
     """
     
     def __init__(self, 
+                 img_height: int = 512,
+                 img_width: int = 512,
                  sh_degree: int = 2,
                  bg_color: Tuple[float, float, float] = (1.0, 1.0, 1.0)):
         super().__init__()
         
+        self.img_height = img_height
+        self.img_width = img_width
         self.sh_degree = sh_degree
         self.register_buffer('bg_color', torch.tensor(bg_color))
         
@@ -136,30 +140,73 @@ class RelightableGaussianRenderer(nn.Module):
         self.register_buffer('default_sh_coeffs', default_sh)
         
     def forward(self,
-                gaussians,
-                camera: Camera,
+                gaussians=None,
+                camera: Camera = None,
                 audio_features: Optional[Tensor] = None,
                 expression_params: Optional[Tensor] = None,
                 sh_coeffs: Optional[Tensor] = None,
                 scaling_modifier: float = 1.0,
                 compute_cov3D_python: bool = False,
-                convert_SHs_python: bool = False) -> RenderOutput:
+                convert_SHs_python: bool = False,
+                # Alternative interface: pass properties directly
+                xyz: Optional[Tensor] = None,
+                scales: Optional[Tensor] = None,
+                rotations: Optional[Tensor] = None,
+                opacity: Optional[Tensor] = None,
+                colors: Optional[Tensor] = None,
+                normals: Optional[Tensor] = None,
+                specular: Optional[Tensor] = None,
+                camera_pose: Optional[Tensor] = None,
+                intrinsics: Optional[Tensor] = None) -> RenderOutput:
         """
         Render Gaussians with relighting.
         
+        Supports two interfaces:
+        1. Pass gaussians model and camera object
+        2. Pass Gaussian properties directly (xyz, scales, rotations, etc.)
+        
         Args:
-            gaussians: RelightableGaussianModel
-            camera: Camera parameters
+            gaussians: RelightableGaussianModel (interface 1)
+            camera: Camera parameters (interface 1)
             audio_features: Audio features for animation
             expression_params: FLAME expression parameters
             sh_coeffs: (9,) or (27,) SH lighting coefficients
             scaling_modifier: Scale modifier for Gaussians
-            compute_cov3D_python: Compute covariance in Python (slower but differentiable)
+            compute_cov3D_python: Compute covariance in Python
             convert_SHs_python: Convert SH in Python
+            xyz: (N, 3) Gaussian positions (interface 2)
+            scales: (N, 3) Gaussian scales (interface 2)
+            rotations: (N, 4) Gaussian rotations as quaternions (interface 2)
+            opacity: (N, 1) Gaussian opacities (interface 2)
+            colors: (N, 3) Gaussian colors/albedo (interface 2)
+            normals: (N, 3) Gaussian normals (interface 2)
+            specular: (N, 1) Specular coefficients (interface 2)
+            camera_pose: (4, 4) Camera pose matrix (interface 2)
+            intrinsics: (3, 3) Camera intrinsics (interface 2)
             
         Returns:
-            RenderOutput containing all rendered maps
+            RenderOutput containing all rendered maps (or dict for interface 2)
         """
+        # Interface 2: Direct property passing
+        if xyz is not None:
+            return self._forward_direct(
+                xyz=xyz,
+                scales=scales,
+                rotations=rotations,
+                opacity=opacity,
+                colors=colors,
+                normals=normals,
+                specular=specular,
+                camera_pose=camera_pose,
+                intrinsics=intrinsics,
+                sh_coeffs=sh_coeffs,
+                scaling_modifier=scaling_modifier
+            )
+        
+        # Interface 1: Pass gaussians model
+        if gaussians is None:
+            raise ValueError("Either 'gaussians' or 'xyz' must be provided")
+            
         # Get Gaussian properties (possibly deformed)
         gaussian_out = gaussians(
             viewpoint_camera=camera,
@@ -175,7 +222,7 @@ class RelightableGaussianRenderer(nn.Module):
         opacity = gaussian_out['opacity']
         albedo = gaussian_out['albedo']
         normals = gaussian_out['normals']
-        specular = gaussian_out['specular']
+        specular = gaussian_out.get('specular', torch.zeros(xyz.shape[0], 1, device=xyz.device))
         
         # Use provided SH coeffs or default
         if sh_coeffs is None:
@@ -191,6 +238,129 @@ class RelightableGaussianRenderer(nn.Module):
                 xyz, scales, rotations, opacity, albedo, normals, specular,
                 camera, sh_coeffs
             )
+    
+    def _forward_direct(self,
+                        xyz: Tensor,
+                        scales: Tensor,
+                        rotations: Tensor,
+                        opacity: Tensor,
+                        colors: Tensor,
+                        normals: Tensor,
+                        specular: Optional[Tensor],
+                        camera_pose: Tensor,
+                        intrinsics: Tensor,
+                        sh_coeffs: Optional[Tensor],
+                        scaling_modifier: float) -> Dict[str, Tensor]:
+        """
+        Direct rendering interface for training scripts.
+        
+        Args:
+            xyz: (N, 3) Gaussian positions
+            scales: (N, 3) Gaussian scales  
+            rotations: (N, 4) Quaternions
+            opacity: (N, 1) Opacities
+            colors: (N, 3) Colors/albedo
+            normals: (N, 3) Normals
+            specular: (N, 1) Specular coefficient (optional)
+            camera_pose: (4, 4) Camera extrinsics (world to camera)
+            intrinsics: (3, 3) Camera intrinsics
+            sh_coeffs: SH coefficients
+            scaling_modifier: Scale modifier
+            
+        Returns:
+            Dict with 'rgb', 'normal', 'depth', 'opacity' maps
+        """
+        device = xyz.device
+        H, W = self.img_height, self.img_width
+        
+        # Handle specular
+        if specular is None:
+            specular = torch.zeros(xyz.shape[0], 1, device=device)
+        
+        # Use provided SH coeffs or default
+        if sh_coeffs is None:
+            sh_coeffs = self.default_sh_coeffs.to(device)
+        
+        # Build camera from pose and intrinsics
+        camera = self._build_camera_from_matrices(camera_pose, intrinsics, H, W)
+        
+        if GAUSSIAN_RASTERIZER_AVAILABLE:
+            output = self._render_with_rasterizer(
+                xyz, scales, rotations, opacity, colors, normals, specular,
+                camera, sh_coeffs, scaling_modifier
+            )
+            return {
+                'rgb': output.rendered_image,
+                'normal': output.normal_map,
+                'depth': output.depth_map,
+                'opacity': output.opacity_map,
+                'albedo': output.albedo_map,
+                'shading': output.shading_map,
+                'radii': output.radii
+            }
+        else:
+            output = self._render_fallback(
+                xyz, scales, rotations, opacity, colors, normals, specular,
+                camera, sh_coeffs
+            )
+            return {
+                'rgb': output.rendered_image,
+                'normal': output.normal_map,
+                'depth': output.depth_map,
+                'opacity': output.opacity_map,
+                'albedo': output.albedo_map,
+                'shading': output.shading_map,
+                'radii': output.radii
+            }
+    
+    def _build_camera_from_matrices(self, 
+                                     camera_pose: Tensor,
+                                     intrinsics: Tensor,
+                                     H: int, W: int) -> Camera:
+        """Build Camera object from pose and intrinsic matrices."""
+        device = camera_pose.device
+        
+        # Extract R and T from camera_pose (4x4 world-to-camera matrix)
+        R = camera_pose[:3, :3]  # (3, 3)
+        T = camera_pose[:3, 3]   # (3,)
+        
+        # Get FOV from intrinsics
+        fx = intrinsics[0, 0]
+        fy = intrinsics[1, 1]
+        fov_x = 2 * torch.atan(W / (2 * fx)).item()
+        fov_y = 2 * torch.atan(H / (2 * fy)).item()
+        
+        # World to view transform
+        world_view = torch.eye(4, device=device)
+        world_view[:3, :3] = R
+        world_view[:3, 3] = T
+        
+        # Projection matrix
+        znear, zfar = 0.01, 100.0
+        tan_half_fov_x = math.tan(fov_x / 2)
+        tan_half_fov_y = math.tan(fov_y / 2)
+        
+        proj = torch.zeros(4, 4, device=device)
+        proj[0, 0] = 1 / tan_half_fov_x
+        proj[1, 1] = 1 / tan_half_fov_y
+        proj[2, 2] = zfar / (zfar - znear)
+        proj[2, 3] = -(zfar * znear) / (zfar - znear)
+        proj[3, 2] = 1
+        
+        # Camera center in world coordinates
+        camera_center = -R.T @ T
+        
+        return Camera(
+            image_width=W,
+            image_height=H,
+            fov_x=fov_x,
+            fov_y=fov_y,
+            world_view_transform=world_view.T,  # Column-major for OpenGL
+            projection_matrix=proj.T,
+            camera_center=camera_center,
+            znear=znear,
+            zfar=zfar
+        )
     
     def _render_with_rasterizer(self,
                                 xyz: Tensor,
@@ -228,13 +398,18 @@ class RelightableGaussianRenderer(nn.Module):
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
         
         # We need to render multiple passes for albedo, normals, depth
-        # Pass 1: Render albedo
-        screenspace_points = torch.zeros_like(xyz, requires_grad=True, device=device) + 0
+        # Pass 1: Render albedo (main pass with gradients)
+        # screenspace_points must be created with requires_grad=True for gradient flow
+        if xyz.requires_grad:
+            screenspace_points = torch.zeros_like(xyz, dtype=xyz.dtype, device=device, requires_grad=True)
+        else:
+            screenspace_points = torch.zeros_like(xyz, dtype=xyz.dtype, device=device, requires_grad=False)
         
         # Create SH features from albedo (just DC component)
         shs_albedo = albedo.unsqueeze(1)  # (N, 1, 3)
         
-        albedo_map, radii = rasterizer(
+        # Note: This custom rasterizer returns (color, radii, depth)
+        albedo_map, radii, raster_depth = rasterizer(
             means3D=xyz,
             means2D=screenspace_points,
             shs=shs_albedo,
@@ -248,14 +423,21 @@ class RelightableGaussianRenderer(nn.Module):
         # Pass 2: Render normals
         # Transform normals to camera space
         R_world_to_cam = camera.world_view_transform[:3, :3].T
-        normals_cam = (R_world_to_cam @ normals.T).T
+        
+        # Safety check: ensure normals are valid before transformation
+        normals_safe = torch.nan_to_num(normals, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Ensure normals are normalized (avoid division by zero)
+        normals_norm = torch.clamp(normals_safe.norm(dim=-1, keepdim=True), min=1e-8)
+        normals_safe = normals_safe / normals_norm
+        
+        normals_cam = (R_world_to_cam @ normals_safe.T).T
         normals_cam = F.normalize(normals_cam, dim=-1)
         
         # Encode normals as colors (map [-1, 1] to [0, 1])
         normals_color = (normals_cam + 1) / 2
         shs_normals = normals_color.unsqueeze(1)
         
-        normal_map, _ = rasterizer(
+        normal_map, _, _ = rasterizer(
             means3D=xyz,
             means2D=screenspace_points.detach(),
             shs=shs_normals,
@@ -281,7 +463,7 @@ class RelightableGaussianRenderer(nn.Module):
         depths_color = depths_norm.expand(-1, 3)
         shs_depth = depths_color.unsqueeze(1)
         
-        depth_map, _ = rasterizer(
+        depth_map, _, _ = rasterizer(
             means3D=xyz,
             means2D=screenspace_points.detach(),
             shs=shs_depth,
@@ -299,7 +481,7 @@ class RelightableGaussianRenderer(nn.Module):
         specular_color = specular.expand(-1, 3)
         shs_spec = specular_color.unsqueeze(1)
         
-        specular_map, _ = rasterizer(
+        specular_map, _, _ = rasterizer(
             means3D=xyz,
             means2D=screenspace_points.detach(),
             shs=shs_spec,
@@ -314,7 +496,7 @@ class RelightableGaussianRenderer(nn.Module):
         ones_color = torch.ones_like(albedo)
         shs_ones = ones_color.unsqueeze(1)
         
-        opacity_map, _ = rasterizer(
+        opacity_map, _, _ = rasterizer(
             means3D=xyz,
             means2D=screenspace_points.detach(),
             shs=shs_ones,

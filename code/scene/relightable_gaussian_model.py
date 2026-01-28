@@ -136,26 +136,28 @@ class RelightableGaussianModel(nn.Module):
     
     @property
     def get_scaling(self) -> Tensor:
-        return torch.exp(self._scaling)
+        # Clamp to prevent numerical overflow (exp(20) ≈ 4.8e8, exp(88) = inf)
+        return torch.exp(torch.clamp(self._scaling, max=20.0, min=-20.0))
     
     @property
     def get_opacity(self) -> Tensor:
-        return torch.sigmoid(self._opacity)
+        # Clamp to prevent sigmoid saturation issues
+        return torch.sigmoid(torch.clamp(self._opacity, min=-20.0, max=20.0))
     
     @property
     def get_albedo(self) -> Tensor:
         """Get albedo in [0, 1] range"""
-        return torch.sigmoid(self._albedo)
+        return torch.sigmoid(torch.clamp(self._albedo, min=-20.0, max=20.0))
     
     @property
     def get_specular(self) -> Tensor:
         """Get specular intensity in [0, 1] range"""
-        return torch.sigmoid(self._specular)
+        return torch.sigmoid(torch.clamp(self._specular, min=-20.0, max=20.0))
     
     @property
     def get_roughness(self) -> Tensor:
         """Get roughness in [0, 1] range"""
-        return torch.sigmoid(self._roughness)
+        return torch.sigmoid(torch.clamp(self._roughness, min=-20.0, max=20.0))
     
     @property
     def get_normals(self) -> Tensor:
@@ -454,7 +456,11 @@ class RelightableGaussianModel(nn.Module):
         
     def densify_and_clone(self, grads: Tensor, grad_threshold: float, 
                           scene_extent: float):
-        """Clone Gaussians with large gradients but small size"""
+        """Clone Gaussians with large gradients but small size
+        
+        Returns:
+            bool: True if densification was performed, False otherwise
+        """
         # Extract points that need cloning
         selected_pts_mask = torch.where(grads.squeeze() >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(
@@ -462,55 +468,102 @@ class RelightableGaussianModel(nn.Module):
             self.get_scaling.max(dim=1).values <= scene_extent * 0.01
         )
         
+        num_cloned = selected_pts_mask.sum().item()
+        if num_cloned == 0:
+            return False
+        
         # Clone the selected Gaussians
-        new_xyz = self._xyz[selected_pts_mask]
-        new_rotation = self._rotation[selected_pts_mask]
-        new_scaling = self._scaling[selected_pts_mask]
-        new_opacity = self._opacity[selected_pts_mask]
-        new_albedo = self._albedo[selected_pts_mask]
-        new_specular = self._specular[selected_pts_mask]
-        new_roughness = self._roughness[selected_pts_mask]
-        new_normals = self._normals[selected_pts_mask]
+        new_xyz = self._xyz.data[selected_pts_mask].clone()
+        new_rotation = self._rotation.data[selected_pts_mask].clone()
+        new_scaling = self._scaling.data[selected_pts_mask].clone()
+        new_opacity = self._opacity.data[selected_pts_mask].clone()
+        new_albedo = self._albedo.data[selected_pts_mask].clone()
+        new_specular = self._specular.data[selected_pts_mask].clone()
+        new_roughness = self._roughness.data[selected_pts_mask].clone()
+        new_normals = self._normals.data[selected_pts_mask].clone()
         
         self._densification_postfix(
             new_xyz, new_rotation, new_scaling, new_opacity,
             new_albedo, new_specular, new_roughness, new_normals
         )
+        return True
         
     def _densification_postfix(self, new_xyz, new_rotation, new_scaling, 
                                new_opacity, new_albedo, new_specular, 
                                new_roughness, new_normals):
-        """Add new Gaussians after densification"""
-        self._xyz = nn.Parameter(torch.cat([self._xyz, new_xyz], dim=0))
-        self._rotation = nn.Parameter(torch.cat([self._rotation, new_rotation], dim=0))
-        self._scaling = nn.Parameter(torch.cat([self._scaling, new_scaling], dim=0))
-        self._opacity = nn.Parameter(torch.cat([self._opacity, new_opacity], dim=0))
-        self._albedo = nn.Parameter(torch.cat([self._albedo, new_albedo], dim=0))
-        self._specular = nn.Parameter(torch.cat([self._specular, new_specular], dim=0))
-        self._roughness = nn.Parameter(torch.cat([self._roughness, new_roughness], dim=0))
-        self._normals = nn.Parameter(torch.cat([self._normals, new_normals], dim=0))
+        """Add new Gaussians after densification
+        
+        NOTE: This modifies the .data of existing Parameters in-place to preserve
+        optimizer state. The optimizer must be updated after calling this method.
+        """
+        device = self._xyz.device
+        
+        # Concatenate new data with existing data
+        combined_xyz = torch.cat([self._xyz.data, new_xyz], dim=0)
+        combined_rotation = torch.cat([self._rotation.data, new_rotation], dim=0)
+        combined_scaling = torch.cat([self._scaling.data, new_scaling], dim=0)
+        combined_opacity = torch.cat([self._opacity.data, new_opacity], dim=0)
+        combined_albedo = torch.cat([self._albedo.data, new_albedo], dim=0)
+        combined_specular = torch.cat([self._specular.data, new_specular], dim=0)
+        combined_roughness = torch.cat([self._roughness.data, new_roughness], dim=0)
+        combined_normals = torch.cat([self._normals.data, new_normals], dim=0)
+        
+        # Create new parameters (optimizer needs to be recreated after this)
+        self._xyz = nn.Parameter(combined_xyz)
+        self._rotation = nn.Parameter(combined_rotation)
+        self._scaling = nn.Parameter(combined_scaling)
+        self._opacity = nn.Parameter(combined_opacity)
+        self._albedo = nn.Parameter(combined_albedo)
+        self._specular = nn.Parameter(combined_specular)
+        self._roughness = nn.Parameter(combined_roughness)
+        self._normals = nn.Parameter(combined_normals)
         
         # Update gradient accumulators
-        device = self._xyz.device
         self.xyz_gradient_accum = torch.zeros((self.num_gaussians, 1), device=device)
         self.denom = torch.zeros((self.num_gaussians, 1), device=device)
         self.max_radii2D = torch.zeros((self.num_gaussians), device=device)
         
+        # Mark that optimizer needs refresh
+        self._optimizer_needs_refresh = True
+        
     def prune_points(self, mask: Tensor):
-        """Remove Gaussians based on mask"""
+        """Remove Gaussians based on mask
+        
+        Returns:
+            bool: True if pruning was performed, False otherwise
+        """
+        num_pruned = mask.sum().item()
+        if num_pruned == 0:
+            return False
+            
         valid_points_mask = ~mask
-        self._xyz = nn.Parameter(self._xyz[valid_points_mask])
-        self._rotation = nn.Parameter(self._rotation[valid_points_mask])
-        self._scaling = nn.Parameter(self._scaling[valid_points_mask])
-        self._opacity = nn.Parameter(self._opacity[valid_points_mask])
-        self._albedo = nn.Parameter(self._albedo[valid_points_mask])
-        self._specular = nn.Parameter(self._specular[valid_points_mask])
-        self._roughness = nn.Parameter(self._roughness[valid_points_mask])
-        self._normals = nn.Parameter(self._normals[valid_points_mask])
+        device = self._xyz.device
+        
+        # Create new parameters with pruned data
+        self._xyz = nn.Parameter(self._xyz.data[valid_points_mask].clone())
+        self._rotation = nn.Parameter(self._rotation.data[valid_points_mask].clone())
+        self._scaling = nn.Parameter(self._scaling.data[valid_points_mask].clone())
+        self._opacity = nn.Parameter(self._opacity.data[valid_points_mask].clone())
+        self._albedo = nn.Parameter(self._albedo.data[valid_points_mask].clone())
+        self._specular = nn.Parameter(self._specular.data[valid_points_mask].clone())
+        self._roughness = nn.Parameter(self._roughness.data[valid_points_mask].clone())
+        self._normals = nn.Parameter(self._normals.data[valid_points_mask].clone())
         
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        
+        # Mark that optimizer needs refresh
+        self._optimizer_needs_refresh = True
+        return True
+    
+    def needs_optimizer_refresh(self):
+        """Check if optimizer needs to be recreated due to parameter changes"""
+        return getattr(self, '_optimizer_needs_refresh', False)
+    
+    def clear_optimizer_refresh_flag(self):
+        """Clear the optimizer refresh flag after recreating optimizer"""
+        self._optimizer_needs_refresh = False
         
     def save_ply(self, path: str):
         """Save Gaussians to PLY file"""

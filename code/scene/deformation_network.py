@@ -62,6 +62,17 @@ class AudioEncoder(nn.Module):
             nn.Linear(d_hidden, d_audio_out),
         )
         
+        # Apply proper initialization
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights using Kaiming initialization for ReLU networks"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
     def forward(self, audio_features: Tensor) -> Tensor:
         """
         Args:
@@ -87,6 +98,17 @@ class ExpressionEncoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(d_hidden, d_expr_out),
         )
+        
+        # Apply proper initialization
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights using Kaiming initialization for ReLU networks"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         
     def forward(self, expression_params: Tensor) -> Tensor:
         """
@@ -134,6 +156,21 @@ class DeformationMLP(nn.Module):
             layers.append(nn.Linear(layer_in, layer_out))
             
         self.layers = nn.ModuleList(layers)
+        
+        # Apply proper initialization
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights using Kaiming initialization for ReLU networks"""
+        for i, layer in enumerate(self.layers):
+            if i < len(self.layers) - 1:
+                # Hidden layers: Kaiming init for ReLU
+                nn.init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
+            else:
+                # Output layer: smaller initialization for stability
+                nn.init.xavier_normal_(layer.weight, gain=0.1)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
         
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -336,7 +373,26 @@ class FLAMEDeformationNetwork(nn.Module):
             nn.Linear(256, 3),  # xyz offset
         )
         
-        # Initialize to produce small outputs
+        # Apply proper initialization
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize all weights properly"""
+        # Initialize LBS weight network with Kaiming
+        for m in self.lbs_weight_net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Initialize expression offset network
+        for m in self.expr_offset_net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Output layer: small initialization for stability
         nn.init.zeros_(self.expr_offset_net[-1].bias)
         nn.init.normal_(self.expr_offset_net[-1].weight, std=0.001)
         
@@ -427,7 +483,26 @@ class HybridDeformationNetwork(nn.Module):
             nn.Linear(128, 3),
         )
         
-        # Initialize audio offset to small values
+        # Apply proper initialization
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize all weights properly"""
+        # Initialize lip region network
+        for m in self.lip_region_net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Initialize audio offset network
+        for m in self.audio_offset_net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Output layer: small initialization for stability
         nn.init.zeros_(self.audio_offset_net[-1].bias)
         nn.init.normal_(self.audio_offset_net[-1].weight, std=0.001)
         
